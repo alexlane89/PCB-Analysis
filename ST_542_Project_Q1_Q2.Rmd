@@ -1,0 +1,949 @@
+---
+title: "ST 542 Project"
+author: "Bingxiao Chen"
+date: "2026-06-27"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Project Goal
+
+This project examines PCB concentration in fish from the Yadkin-Pee Dee River Basin. The main goals are to evaluate whether PCB concentration differs by waterbody and species, determine whether PCB concentration can be predicted from fish and waterbody characteristics, and compare lower-cost measurement methods with HRMS.
+
+This report uses two primary response variables:
+
+- `total_pcb_weight`: PCB concentration relative to fish tissue weight.
+- `mg_total_pcb_g_lipid`: PCB concentration relative to lipid tissue.
+
+Because PCB measurements are strongly right-skewed, regression models are fit using log-transformed responses.
+
+# Load Packages and Data
+
+```{r load-packages}
+library(tidyverse)
+library(janitor)
+library(readxl)
+library(GGally)
+library(car)
+library(mgcv)
+library(broom)
+library(openxlsx)
+```
+
+```{r load-data}
+fish_raw <- read_excel(
+  "YPD_NCSU_nd0.xlsx",
+  sheet = "LR data-nd0",
+  skip = 3
+) |> 
+  clean_names()
+
+fish <- fish_raw |>
+  mutate(
+    waterbody = factor(waterbody),
+    species = factor(species),
+    species_name = factor(species_name),
+    trophic_status = factor(trophic_status),
+    guild = factor(guild),
+    sample_id = as.character(sample_id)
+  ) |>
+  droplevels()
+
+glimpse(fish)
+```
+
+# Data Preparation
+
+## Create log responses
+
+
+```{r log-responses}
+
+fish <- fish |>
+  mutate(
+    log_total_pcb = log(total_pcb_weight),
+    log_lipid_pcb = log(mg_total_pcb_g_lipid)
+  )
+
+summary(fish[, c("total_pcb_weight", "mg_total_pcb_g_lipid", "log_total_pcb", "log_lipid_pcb")])
+```
+
+## Species grouping
+
+Several species have very small sample sizes. To avoid unstable regression coefficients, species are grouped into biologically meaningful categories.
+
+```{r species-group}
+fish <- fish |>
+  mutate(
+    species_group = case_when(
+      species %in% c("CCF", "BCF", "WCF", "BB", "FB", "FCF") ~ "Catfish",
+      species %in% c("BCR", "WCR") ~ "Crappie",
+      species %in% c("BG", "RE", "RBS") ~ "Sunfish",
+      species == "LMB" ~ "Largemouth Bass",
+      species %in% c("WB", "WP", "YP") ~ "Temperate Bass/Perch",
+      TRUE ~ "Other"
+    ),
+    species_group = factor(species_group)
+  ) |>
+  droplevels()
+
+fish |>
+  count(species, species_name, species_group, guild, tl) |>
+  arrange(species_group, species)
+
+fish |>
+  count(species_group)
+```
+
+## Diet grouping
+
+Another method of combination is to group observations by diet / trophic status as opposed to species groups.
+
+```{r species-group}
+#fish$diet_group <- paste(fish$trophic_status, fish$guild, sep = " - ")
+#fish$diet_group <- factor(fish$diet_group)
+ 
+#cat("Distinct diet groups found:\n")
+#print(levels(fish$diet_group))
+ 
+#cat("\nSample counts per diet group:\n")
+#print(table(fish$diet_group))
+
+
+fish |>
+  count(trophic_status)
+```
+
+
+# Exploratory Data Analysis
+
+## Missing data
+
+```{r missing-data}
+fish |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") |>
+  filter(n_missing > 0)
+```
+
+# RQ1: Waterbody & Species impact on PCB concentration
+## Distribution of response variables
+
+```{r response-distributions}
+ggplot(fish, aes(total_pcb_weight)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Distribution of PCB/weight", x = "PCB/weight", y = "Count") +
+  theme_bw()
+
+ggplot(fish, aes(log_total_pcb)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Distribution of log PCB/weight", x = "log(PCB/weight)", y = "Count") +
+  theme_bw()
+
+ggplot(fish, aes(mg_total_pcb_g_lipid)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Distribution of PCB/lipid", x = "PCB/lipid", y = "Count") +
+  theme_bw()
+
+ggplot(fish, aes(log_lipid_pcb)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Distribution of log PCB/lipid", x = "log(PCB/lipid + offset)", y = "Count") +
+  theme_bw()
+```
+
+
+Both PCB response variables shows substantial right skew, with a small number of fish having much higher PCB concentrations than the majority of observations. The log transformation reduced the skewness and produces distributions that are closer to normal, making linear regression assumptions more reasonable. So, all regression analyses for RQ2 are performed using the log-transformed responses rather than the raw PCB concentrations.  
+
+
+## Summary by waterbody and species group
+
+```{r group-summary}
+fish |>
+  group_by(waterbody) |>
+  summarise(
+    n = n(),
+    mean_total_pcb = mean(total_pcb_weight, na.rm = TRUE),
+    median_total_pcb = median(total_pcb_weight, na.rm = TRUE),
+    mean_lipid_pcb = mean(mg_total_pcb_g_lipid, na.rm = TRUE),
+    median_lipid_pcb = median(mg_total_pcb_g_lipid, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+fish |>
+  group_by(species_group) |>
+  summarise(
+    n = n(),
+    mean_total_pcb = mean(total_pcb_weight, na.rm = TRUE),
+    median_total_pcb = median(total_pcb_weight, na.rm = TRUE),
+    mean_lipid_pcb = mean(mg_total_pcb_g_lipid, na.rm = TRUE),
+    median_lipid_pcb = median(mg_total_pcb_g_lipid, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n))
+
+fish |>
+  group_by(trophic_status) |>
+  summarise(
+    n = n(),
+    mean_total_pcb = mean(total_pcb_weight, na.rm = TRUE),
+    median_total_pcb = median(total_pcb_weight, na.rm = TRUE),
+    mean_lipid_pcb = mean(mg_total_pcb_g_lipid, na.rm = TRUE),
+    median_lipid_pcb = median(mg_total_pcb_g_lipid, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n))
+```
+
+
+Mean PCB concentrations varied across waterbodies, although considerable within-waterbody variability was also observed. BL had the highest average PCB/weight, whereas LT showed the lowest average PCB/lipid concentration. Because these summaries do not adjust for differences in fish characteristics among waterbodies, regression modeling is used in RQ2 to determine whether these differences remain after accounting for fish size and biological factors.  
+
+PCB concentrations also differed among species groups. Catfish and Temperate Bass/Perch generally exhibited higher PCB/weight concentrations than Crappie and Largemouth Bass. However, some species groups contained relatively small sample sizes, particularly the Temperate Bass/Perch group (n = 6), so these summaries should be interpreted cautiously. 
+
+## Response by waterbody and species group
+
+```{r response-boxplots}
+ggplot(fish, aes(waterbody, log_total_pcb)) +
+  geom_boxplot() +
+  labs(title = "Log PCB/weight by waterbody", x = "Waterbody", y = "log PCB/weight") +
+  theme_bw()
+
+ggplot(fish, aes(reorder(species_group, log_total_pcb, median), log_total_pcb)) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(title = "Log PCB/weight by species group", x = "Species group", y = "log PCB/weight") +
+  theme_bw()
+
+ggplot(fish, aes(waterbody, log_lipid_pcb)) +
+  geom_boxplot() +
+  labs(title = "Log PCB/lipid by waterbody", x = "Waterbody", y = "log PCB/lipid") +
+  theme_bw()
+
+ggplot(fish, aes(reorder(species_group, log_lipid_pcb, median), log_lipid_pcb)) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(title = "Log PCB/lipid by species group", x = "Species group", y = "log PCB/lipid") +
+  theme_bw()
+```
+
+
+The boxplots suggest modest differences among waterbodies but also reveal substantial overlap between groups. The wide spread within each waterbody indicates that environmental location alone is unlikely to fully explain PCB variability, motivating the inclusion of additional biological predictors in the regression models.
+
+Greater separation is observed among species groups than among waterbodies, particularly for PCB/weight. This suggests that species-related biological characteristics may contribute more strongly to PCB accumulation than sampling location alone. Nevertheless, considerable variability remains within each species group, indicating that additional predictors are needed for accurate prediction.
+
+## Waterbody & Species ANOVA
+
+```{r}
+# Plot of residuals for total PCB/wt ~ waterbody*species
+model_wt <- aov(log_total_pcb ~ waterbody*species, data = fish)
+plot(model, which = 1)
+```
+
+The residuals vs fitted display for log transform of Total PCB wt / fish wt show apparent nonhomogeneity of error variance for the model.
+
+```{r}
+# Levene's test for homogeneity of variance
+lev_wt <- leveneTest(log_total_pcb ~ species_group, data = fish)
+cat("Levene's test on total PCB wt for homogeneity of variance: F =", round(lev_wt$`F value`[1], 3),
+    ", p =", signif(lev_wt$`Pr(>F)`[1], 3), "\n")
+
+lev_lipid <- leveneTest(log_lipid_pcb ~ species_group, data = fish)
+cat("Levene's test on total lipid wt for homogeneity of variance: F =", round(lev_lipid$`F value`[1], 3),
+    ", p =", signif(lev_lipid$`Pr(>F)`[1], 3), "\n")
+```
+
+
+```{r}
+# Analysis of Variance for total PCB/wt dependent on waterbody, species, and their interaction
+anova(model_wt)
+```
+
+The interaction effect of waterbody & species is significant at $\alpha$ = 0.05 level for the total PCB wt/fish wt response. It is inappropriate then, to assess the main effects of each separately on PCB wt/wt
+
+```{r}
+# Plot of residuals for total PCB/wt ~ waterbody*species
+model_lipid <- aov(log_lipid_pcb ~ waterbody*species, data = fish)
+plot(model_lipid, which = 1)
+```
+
+The residuals vs fitted display for log transform of Total PCB wt / fish wt show apparent nonhomogeneity of error variance for the model.
+
+```{r}
+# Analysis of Variance for total PCB/wt dependent on waterbody, species, and their interaction
+anova(model_lipid)
+```
+
+
+# Variable Selection for RQ2
+
+For prediction modeling, the candidate predictors are waterbody, fish size, percent lipid, trophic level, guild, and species group. Two important decisions are made before fitting the final models.
+
+First, fish length and fish weight are highly correlated measures of body size. Including both can create multicollinearity. Weight is retained as the main body size predictor because it is more directly related to fish biomass and contaminant burden.
+
+Second, species, species group, trophic level, trophic status, and guild are overlapping ecological variables. So the models below do not include species group and trophic variables at the same time.
+
+```{r collinearity-check}
+fish |>
+  select(l_mm, wt_g, percent_lipid, tl, log_total_pcb, log_lipid_pcb) |>
+  ggpairs()
+
+cor(fish$l_mm, fish$wt_g, use = "complete.obs")
+```
+
+
+## Compare body size options
+
+```{r body-size-models}
+size_weight_total <- lm(log_total_pcb ~ waterbody + wt_g + percent_lipid, data = fish)
+size_length_total <- lm(log_total_pcb ~ waterbody + l_mm + percent_lipid, data = fish)
+size_both_total <- lm(log_total_pcb ~ waterbody + l_mm + wt_g + percent_lipid, data = fish)
+
+AIC(size_weight_total, size_length_total, size_both_total)
+car::vif(size_both_total)
+```
+
+Fish length and weight are strongly correlated (r = 0.84), indicating that both variables measure similar aspects of body size. Including both predictors simultaneously would provide little additional information while increasing model complexity. Model comparison using AIC showed that the weight-only model performed slightly better than the length-only or combined models, so fish weight was retained as the primary body-size predictor for subsequent analyses. Variance inflation factors were below commonly used thresholds, suggesting that multicollinearity was not severe after excluding fish length.
+
+# RQ2: Multiple Linear Regression
+
+Two sets of models are fit for each response.
+
+- Baseline model: waterbody + weight + percent lipid.
+- Trait-based model: baseline + trophic level + guild.
+- Species-group model: baseline + species group.
+
+The trait-based and species-group models answer slightly different questions. The trait-based model asks whether PCB levels can be predicted using ecological traits. The species-group model asks whether knowing the fish group improves prediction.
+
+## Linear models for PCB/weight
+
+```{r lm-total}
+lm_total_baseline <- lm(
+  log_total_pcb ~ waterbody + wt_g + percent_lipid,
+  data = fish
+)
+
+lm_total_trait <- lm(
+  log_total_pcb ~ waterbody + wt_g + percent_lipid + tl + guild,
+  data = fish
+)
+
+lm_total_species <- lm(
+  log_total_pcb ~ waterbody + wt_g + percent_lipid + species_group,
+  data = fish
+)
+
+summary(lm_total_baseline)
+summary(lm_total_trait)
+summary(lm_total_species)
+```
+
+The baseline model explained only a small proportion of the variation in PCB/weight (Adjusted R² = 0.044), indicating that waterbody, fish weight, and percent lipid alone have limited predictive ability. Fish weight and percent lipid were statistically significant predictors, while most waterbody effects were not significant after adjusting for the other variables.  
+
+Adding trophic level and feeding guild substantially improved model performance, increasing the adjusted R² from 0.04 to approximately 0.20. Trophic level was positively associated with PCB concentration, consistent with biomagnification, whereby contaminants accumulate at higher trophic levels. Nevertheless, approximately 80% of the variation in PCB concentration remained unexplained, suggesting that important sources of variability were not captured by the available predictors.  
+
+Replacing ecological traits with species groups produced a model with nearly identical predictive performance to the trait-based model. This finding suggests that much of the predictive information contained in species identity is also represented by ecological characteristics such as trophic level and feeding behavior. 
+
+Although the adjusted R² values are modest, this result is not unexpected for ecological field data. PCB accumulation is influenced by numerous biological and environmental factors that were unavailable in the current dataset, including fish age, diet history, contaminant exposure, and spatial variation within waterbodies. Consequently, a substantial amount of unexplained variability remains even after accounting for fish size, lipid content, and ecological traits. The purpose of these models is therefore to identify important predictors rather than to achieve highly accurate prediction.
+
+
+Prediction of PCB concentration normalized by lipid content was substantially more successful than prediction of PCB concentration normalized by tissue weight. The trait-based model explained approximately 43% of the observed variation, suggesting that lipid-normalized PCB concentrations are more closely associated with biological characteristics such as trophic level and feeding guild.  
+
+
+
+## Linear models for PCB/lipid
+
+```{r lm-lipid}
+lm_lipid_baseline <- lm(
+  log_lipid_pcb ~ waterbody + wt_g + percent_lipid,
+  data = fish
+)
+
+lm_lipid_trait <- lm(
+  log_lipid_pcb ~ waterbody + wt_g + percent_lipid + tl + guild,
+  data = fish
+)
+
+lm_lipid_species <- lm(
+  log_lipid_pcb ~ waterbody + wt_g + percent_lipid + species_group,
+  data = fish
+)
+
+summary(lm_lipid_baseline)
+summary(lm_lipid_trait)
+summary(lm_lipid_species)
+```
+
+```{r lm-lipid-vif}
+car::vif(lm_lipid_baseline)
+car::vif(lm_lipid_trait)
+car::vif(lm_lipid_species)
+```
+
+## Linear model comparison
+
+```{r lm-comparison}
+model_metrics <- function(model) {
+  tibble(
+    AIC = AIC(model),
+    adj_r_squared = summary(model)$adj.r.squared,
+    RMSE = sqrt(mean(residuals(model)^2, na.rm = TRUE)),
+    n = nobs(model)
+  )
+}
+
+bind_rows(
+  model_metrics(lm_total_baseline) |> mutate(response = "PCB/weight", model = "Baseline"),
+  model_metrics(lm_total_trait) |> mutate(response = "PCB/weight", model = "Trait-based"),
+  model_metrics(lm_total_species) |> mutate(response = "PCB/weight", model = "Species-group"),
+  model_metrics(lm_lipid_baseline) |> mutate(response = "PCB/lipid", model = "Baseline"),
+  model_metrics(lm_lipid_trait) |> mutate(response = "PCB/lipid", model = "Trait-based"),
+  model_metrics(lm_lipid_species) |> mutate(response = "PCB/lipid", model = "Species-group")
+) |>
+  select(response, model, AIC, adj_r_squared, RMSE, n) |>
+  arrange(response, AIC)
+```
+
+# RQ2: Outlier and Influence Diagnostics
+
+Outliers are evaluated using three criteria:
+
+- Absolute studentized residual greater than 3.
+- Cook's distance greater than 4/n.
+- Leverage greater than 2p/n, where p is the number of estimated coefficients.
+
+These are screening rules. Flagged observations should be reviewed rather than automatically deleted.
+
+```{r outlier-function}
+identify_outliers <- function(model, data, model_name) {
+  n <- nobs(model)
+  p <- length(coef(model))
+  aug <- broom::augment(model, data = data)
+  aug |>
+    mutate(
+      model_name = model_name,
+      studentized_resid = rstudent(model),
+      cooks_d = cooks.distance(model),
+      leverage = hatvalues(model),
+      flag_studentized = abs(studentized_resid) > 3,
+      flag_cook = cooks_d > 4 / n,
+      flag_leverage = leverage > 2 * p / n,
+      outlier_flag = flag_studentized | flag_cook | flag_leverage
+    )
+}
+
+out_total <- identify_outliers(lm_total_species, fish, "PCB_weight_species_model")
+out_lipid <- identify_outliers(lm_lipid_species, fish, "PCB_lipid_species_model")
+
+out_total |>
+  filter(outlier_flag) |>
+  select(sample_id, waterbody, species, species_name, species_group,
+         total_pcb_weight, log_total_pcb, studentized_resid, cooks_d, leverage,
+         flag_studentized, flag_cook, flag_leverage)
+
+out_lipid |>
+  filter(outlier_flag) |>
+  select(sample_id, waterbody, species, species_name, species_group,
+         mg_total_pcb_g_lipid, log_lipid_pcb, studentized_resid, cooks_d, leverage,
+         flag_studentized, flag_cook, flag_leverage)
+```
+
+## Diagnostic plots
+
+```{r diagnostic-plots-total, fig.width=7, fig.height=7}
+par(mfrow = c(2, 2))
+plot(lm_total_species)
+par(mfrow = c(1, 1))
+```
+
+```{r diagnostic-plots-lipid, fig.width=7, fig.height=7}
+par(mfrow = c(2, 2))
+plot(lm_lipid_species)
+par(mfrow = c(1, 1))
+```
+
+## Export highlighted outlier workbook
+
+The workbook highlights rows that were flagged by at least one influence diagnostic. It also highlights the specific diagnostic columns that triggered the flag.
+
+```{r export-outliers}
+export_outlier_workbook <- function(out_total, out_lipid, file = "RQ2_Outlier_Diagnostics.xlsx") {
+  wb <- createWorkbook()
+  red_row <- createStyle(fgFill = "#FFC7CE")
+  red_cell <- createStyle(fgFill = "#FF0000", fontColour = "#FFFFFF")
+  
+  sheets <- list(
+    PCB_weight_model = out_total,
+    PCB_lipid_model = out_lipid
+  )
+  
+  for (sheet_name in names(sheets)) {
+    dat <- sheets[[sheet_name]] |>
+      select(model_name, sample_id, waterbody, species, species_name, species_group,
+             total_pcb_weight, mg_total_pcb_g_lipid, log_total_pcb, log_lipid_pcb,
+             wt_g, l_mm, percent_lipid, tl, guild,
+             .fitted, .resid, studentized_resid, cooks_d, leverage,
+             flag_studentized, flag_cook, flag_leverage, outlier_flag)
+    
+    addWorksheet(wb, sheet_name)
+    writeData(wb, sheet_name, dat)
+    freezePane(wb, sheet_name, firstRow = TRUE)
+    addFilter(wb, sheet_name, rows = 1, cols = 1:ncol(dat))
+    
+    flagged_rows <- which(dat$outlier_flag) + 1
+    if (length(flagged_rows) > 0) {
+      addStyle(
+        wb, sheet = sheet_name, style = red_row,
+        rows = flagged_rows, cols = 1:ncol(dat),
+        gridExpand = TRUE, stack = TRUE
+      )
+    }
+    
+    diagnostic_cols <- which(names(dat) %in% c("flag_studentized", "flag_cook", "flag_leverage", "outlier_flag"))
+    for (col in diagnostic_cols) {
+      flagged_cells <- which(dat[[col]] == TRUE) + 1
+      if (length(flagged_cells) > 0) {
+        addStyle(
+          wb, sheet = sheet_name, style = red_cell,
+          rows = flagged_cells, cols = col,
+          gridExpand = TRUE, stack = TRUE
+        )
+      }
+    }
+    
+    setColWidths(wb, sheet_name, cols = 1:ncol(dat), widths = "auto")
+  }
+  
+  saveWorkbook(wb, file, overwrite = TRUE)
+}
+
+export_outlier_workbook(out_total, out_lipid)
+```
+
+# RQ2: Sensitivity Analysis
+
+The sensitivity analysis refits the selected linear models after removing observations flagged by any of the influence diagnostics.
+
+```{r sensitivity-analysis}
+flagged_total_ids <- out_total |>
+  filter(outlier_flag) |>
+  pull(sample_id)
+
+flagged_lipid_ids <- out_lipid |>
+  filter(outlier_flag) |>
+  pull(sample_id)
+
+fish_total_no_outliers <- fish |>
+  filter(!sample_id %in% flagged_total_ids)
+
+fish_lipid_no_outliers <- fish |>
+  filter(!sample_id %in% flagged_lipid_ids)
+
+lm_total_species_sens <- lm(
+  log_total_pcb ~ waterbody + wt_g + percent_lipid + species_group,
+  data = fish_total_no_outliers
+)
+
+lm_lipid_species_sens <- lm(
+  log_lipid_pcb ~ waterbody + wt_g + percent_lipid + species_group,
+  data = fish_lipid_no_outliers
+)
+
+bind_rows(
+  tidy(lm_total_species) |> mutate(response = "PCB/weight", analysis = "Original"),
+  tidy(lm_total_species_sens) |> mutate(response = "PCB/weight", analysis = "No flagged observations"),
+  tidy(lm_lipid_species) |> mutate(response = "PCB/lipid", analysis = "Original"),
+  tidy(lm_lipid_species_sens) |> mutate(response = "PCB/lipid", analysis = "No flagged observations")
+) |>
+  select(response, analysis, term, estimate, std.error, statistic, p.value)
+```
+
+# RQ2: Nonparametric Regression
+
+Generalized additive models are used as the nonparametric regression approach. GAMs allow the continuous predictors to have nonlinear relationships with PCB concentration while keeping categorical predictors interpretable.
+
+The smooth terms are used for fish weight and percent lipid. Trophic level has only a few distinct values, so it is left as a linear numeric predictor in the trait-based GAM.
+
+## GAMs for PCB/weight
+
+```{r gam-total}
+gam_total_trait <- gam(
+  log_total_pcb ~ waterbody + s(wt_g, k = 6) + s(percent_lipid, k = 5) + tl + guild,
+  data = fish,
+  method = "REML"
+)
+
+gam_total_species <- gam(
+  log_total_pcb ~ waterbody + s(wt_g, k = 6) + s(percent_lipid, k = 5) + species_group,
+  data = fish,
+  method = "REML"
+)
+
+summary(gam_total_trait)
+summary(gam_total_species)
+```
+
+```{r gam-total-plots}
+plot(gam_total_species, pages = 1, shade = TRUE)
+```
+
+## GAMs for PCB/lipid
+
+```{r gam-lipid}
+gam_lipid_trait <- gam(
+  log_lipid_pcb ~ waterbody + s(wt_g, k = 6) + s(percent_lipid, k = 5) + tl + guild,
+  data = fish,
+  method = "REML"
+)
+
+gam_lipid_species <- gam(
+  log_lipid_pcb ~ waterbody + s(wt_g, k = 6) + s(percent_lipid, k = 5) + species_group,
+  data = fish,
+  method = "REML"
+)
+
+summary(gam_lipid_trait)
+summary(gam_lipid_species)
+```
+
+```{r gam-lipid-plots}
+plot(gam_lipid_species, pages = 1, shade = TRUE)
+```
+
+## Linear model versus GAM comparison
+
+```{r gam-comparison}
+gam_metrics <- function(model) {
+  tibble(
+    AIC = AIC(model),
+    deviance_explained = summary(model)$dev.expl,
+    RMSE = sqrt(mean(residuals(model)^2, na.rm = TRUE)),
+    n = nobs(model)
+  )
+}
+
+bind_rows(
+  model_metrics(lm_total_trait) |> mutate(response = "PCB/weight", model_type = "Linear", model = "Trait-based"),
+  model_metrics(lm_total_species) |> mutate(response = "PCB/weight", model_type = "Linear", model = "Species-group"),
+  gam_metrics(gam_total_trait) |> mutate(response = "PCB/weight", model_type = "GAM", model = "Trait-based"),
+  gam_metrics(gam_total_species) |> mutate(response = "PCB/weight", model_type = "GAM", model = "Species-group"),
+  model_metrics(lm_lipid_trait) |> mutate(response = "PCB/lipid", model_type = "Linear", model = "Trait-based"),
+  model_metrics(lm_lipid_species) |> mutate(response = "PCB/lipid", model_type = "Linear", model = "Species-group"),
+  gam_metrics(gam_lipid_trait) |> mutate(response = "PCB/lipid", model_type = "GAM", model = "Trait-based"),
+  gam_metrics(gam_lipid_species) |> mutate(response = "PCB/lipid", model_type = "GAM", model = "Species-group")
+) |>
+  select(response, model_type, model, everything()) |>
+  arrange(response, AIC)
+```
+
+# RQ2: Random Forest, Regression Tree, Linear/Nonlinear Models CV
+
+The regression tree is useful because it provides a simple, interpretable set of decision rules. For example, the first split identifies the predictor that best separates fish into groups with different PCB concentrations, making it easy to understand the hierarchical relationships among predictors.
+
+The random forest extends this idea by averaging hundreds of regression trees built from bootstrap samples of the data. This generally reduces prediction error and overfitting while providing measures of variable importance. Compared with a single regression tree, the random forest is expected to produce more stable predictions and better predictive accuracy, although at the expense of interpretability.
+
+## Regression Tree for PCB/weight
+```{r}
+library(rpart)
+library(rpart.plot)
+
+set.seed(123)
+
+tree_total <- rpart(
+  log(total_pcb_weight) ~
+    waterbody +
+    wt_g +
+    percent_lipid +
+    tl +
+    guild,
+  data = fish,
+  method = "anova"
+)
+
+summary(tree_total)
+
+# plot the tree 
+rpart.plot(
+  tree_total,
+  type = 2,
+  extra = 101,
+  fallen.leaves = TRUE,
+  box.palette = "GnBu"
+)
+
+# variable importance 
+tree_total$variable.importance
+
+# Predictions
+pred_tree <- predict(tree_total)
+
+RMSE_tree <- sqrt(mean(
+  (log(fish$total_pcb_weight) - pred_tree)^2
+))
+
+RMSE_tree
+
+
+```
+
+## Regression Tree for PCB/lipid
+```{r}
+tree_lipid <- rpart(
+  log(mg_total_pcb_g_lipid) ~
+    waterbody +
+    wt_g +
+    percent_lipid +
+    tl +
+    guild,
+  data = fish,
+  method = "anova"
+)
+
+rpart.plot(tree_lipid)
+
+# Predictions
+pred_tree_lipid <- predict(tree_lipid)
+
+RMSE_tree_lipid <- sqrt(mean(
+  (log(fish$mg_total_pcb_g_lipid) - pred_tree_lipid)^2
+))
+
+RMSE_tree_lipid
+```
+
+## Random Forest for PCB/weight 
+```{r}
+library(ranger)
+
+set.seed(123)
+
+rf_total <- ranger(
+
+  log(total_pcb_weight) ~
+    waterbody +
+    wt_g +
+    percent_lipid +
+    tl +
+    guild,
+
+  data = fish,
+
+  importance = "permutation",
+
+  num.trees = 500,
+
+  seed = 123
+
+)
+
+rf_total$predictions
+
+pred_rf <- rf_total$predictions
+
+RMSE_rf <- sqrt(mean(
+
+(log(fish$total_pcb_weight) - pred_rf)^2
+
+))
+
+RMSE_rf
+
+
+importance_df <-data.frame(Variable = names(importance(rf_total)), Importance = importance(rf_total))
+
+ggplot(importance_df,aes(reorder(Variable, Importance),Importance))+geom_col(fill="steelblue")+
+  coord_flip()+
+  theme_bw()
+```
+
+## Random Forest for PCB/lipid
+```{r}
+rf_lipid <- ranger( log(mg_total_pcb_g_lipid) ~waterbody +wt_g +percent_lipid +tl +guild,
+                    data=fish,importance="permutation",num.trees=500,seed=123)
+
+rf_lipid
+```
+
+## CV of all methods for PCB/weight
+```{r}
+library(caret)
+
+ctrl <- trainControl(method = "cv",number = 10)
+
+lm_cv <- train(log(total_pcb_weight) ~waterbody +wt_g +percent_lipid +tl +guild,
+               data = fish,method = "lm",trControl = ctrl)
+
+tree_cv <- train(log(total_pcb_weight) ~waterbody +wt_g +percent_lipid +tl +guild,
+                 data = fish,method = "rpart",trControl = ctrl)
+
+rf_cv <- train(log(total_pcb_weight) ~waterbody +wt_g +percent_lipid +tl +guild,
+               data = fish,method = "ranger",trControl = ctrl,importance = "permutation")
+
+gam_cv <- train(
+  log(total_pcb_weight) ~
+    waterbody +
+    wt_g +
+    percent_lipid +
+    tl +
+    guild,
+  data = fish,
+  method = "gamSpline",
+  trControl = ctrl
+)
+
+# Compare
+resamps <- resamples(list(LM = lm_cv,Tree = tree_cv,RF = rf_cv))
+
+summary(resamps)
+```
+
+
+# RQ1: Group Differences
+
+This section addresses whether mean PCB concentration differs by waterbody and species group. Because the response is right-skewed, the log-transformed responses are used.
+
+```{r rq1-models}
+rq1_total <- lm(log_total_pcb ~ waterbody + species_group, data = fish)
+rq1_lipid <- lm(log_lipid_pcb ~ waterbody + species_group, data = fish)
+
+anova(rq1_total)
+anova(rq1_lipid)
+summary(rq1_total)
+summary(rq1_lipid)
+```
+
+```{r rq1-interaction-check}
+rq1_total_int <- lm(log_total_pcb ~ waterbody * species_group, data = fish)
+rq1_lipid_int <- lm(log_lipid_pcb ~ waterbody * species_group, data = fish)
+
+AIC(rq1_total, rq1_total_int)
+AIC(rq1_lipid, rq1_lipid_int)
+```
+
+# RQ3: Method Comparison
+
+This section compares lower-cost methods against HRMS for the subset of 33 congeners.
+
+```{r method-scatterplots}
+ggplot(fish, aes(hrms_33_lr, lrms_33)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0) +
+  labs(title = "LRMS versus HRMS", x = "HRMS", y = "LRMS") +
+  theme_bw()
+
+ggplot(fish, aes(hrms_33_lr, lrmsms_33)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0) +
+  labs(title = "LRMSMS versus HRMS", x = "HRMS", y = "LRMSMS") +
+  theme_bw()
+```
+
+```{r method-correlations}
+fish |>
+  select(hrms_33_lr, lrms_33, lrmsms_33) |>
+  cor(use = "complete.obs")
+```
+
+```{r method-differences}
+method_diff <- fish |>
+  transmute(
+    sample_id,
+    hrms = hrms_33_lr,
+    lrms = lrms_33,
+    lrmsms = lrmsms_33,
+    diff_lrms = lrms - hrms,
+    avg_lrms = (lrms + hrms) / 2,
+    diff_lrmsms = lrmsms - hrms,
+    avg_lrmsms = (lrmsms + hrms) / 2
+  )
+
+method_diff |>
+  summarise(
+    mean_bias_lrms = mean(diff_lrms, na.rm = TRUE),
+    sd_diff_lrms = sd(diff_lrms, na.rm = TRUE),
+    mean_bias_lrmsms = mean(diff_lrmsms, na.rm = TRUE),
+    sd_diff_lrmsms = sd(diff_lrmsms, na.rm = TRUE)
+  )
+
+ggplot(method_diff, aes(avg_lrms, diff_lrms)) +
+  geom_point() +
+  geom_hline(yintercept = 0) +
+  labs(title = "Difference plot: LRMS - HRMS", x = "Average of LRMS and HRMS", y = "LRMS - HRMS") +
+  theme_bw()
+
+ggplot(method_diff, aes(avg_lrmsms, diff_lrmsms)) +
+  geom_point() +
+  geom_hline(yintercept = 0) +
+  labs(title = "Difference plot: LRMSMS - HRMS", x = "Average of LRMSMS and HRMS", y = "LRMSMS - HRMS") +
+  theme_bw()
+```
+```{r paired equivalence testing}
+library(TOSTER)
+
+# Difference variables
+fish <- fish %>%
+  mutate(
+    diff_lrms = lrms_33 - hrms_33_lr,
+    diff_lrmsms = lrmsms_33 - hrms_33_lr
+  )
+
+# acceptable difference is within +/- 5 units lrms
+TOSTpaired(
+  n = sum(complete.cases(fish$hrms_33_lr, fish$lrms_33)),
+  low_eqbound = -5,
+  high_eqbound = 5,
+  alpha = 0.05,
+  m1 = mean(fish$lrms_33, na.rm = TRUE),
+  m2 = mean(fish$hrms_33_lr, na.rm = TRUE),
+  sd1 = sd(fish$lrms_33, na.rm = TRUE),
+  sd2 = sd(fish$hrms_33_lr, na.rm = TRUE),
+  r12 = cor(fish$lrms_33, fish$hrms_33_lr, use = "complete.obs")
+)
+
+#lrmsms
+TOSTpaired(
+  n = sum(complete.cases(fish$hrms_33_lr, fish$lrmsms_33)),
+  low_eqbound = -5,
+  high_eqbound = 5,
+  alpha = 0.05,
+  m1 = mean(fish$lrmsms_33, na.rm = TRUE),
+  m2 = mean(fish$hrms_33_lr, na.rm = TRUE),
+  sd1 = sd(fish$lrmsms_33, na.rm = TRUE),
+  sd2 = sd(fish$hrms_33_lr, na.rm = TRUE),
+  r12 = cor(fish$lrmsms_33, fish$hrms_33_lr, use = "complete.obs")
+)
+
+
+```
+Assuming HRMS is the true value, what is the probability that this study can detect that LRMS/LRMSMS differs from HRMS by at least some meaningful amount?
+
+```{r}
+diff_lrms <- fish$lrms_33 - fish$hrms_33_lr
+diff_lrmsms <- fish$lrmsms_33 - fish$hrms_33_lr
+
+mean(diff_lrms)
+mean(diff_lrmsms)
+
+library(pwr)
+
+pwr.t.test(
+  n = sum(complete.cases(fish$lrms_33, fish$hrms_33_lr)),
+  d = mean(diff_lrms, na.rm = TRUE) / sd(diff_lrms, na.rm = TRUE),
+  sig.level = 0.05,
+  type = "paired",
+  alternative = "two.sided"
+)
+
+pwr.t.test(
+  n = sum(complete.cases(fish$lrmsms_33, fish$hrms_33_lr)),
+  d = mean(diff_lrmsms, na.rm = TRUE) / sd(diff_lrmsms, na.rm = TRUE),
+  sig.level = 0.05,
+  type = "paired",
+  alternative = "two.sided"
+)
+```
+
